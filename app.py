@@ -544,12 +544,13 @@ with tab_ai:
     )
 
     if model_available():
-        st.success("✅ Файл модели найден")
+        st.success("✅ Модель загружена")
     else:
-        st.warning(
-            "⚠️ Модель ещё не подключена. "
-            "Необходимо добавить models/road_damage.pt"
-        )
+        st.info(
+            "🤖 Модель будет автоматически загружена "
+            "при первом анализе фотографии. "
+            "Первый запуск может занять некоторое время."
+    )
 
     ai_image = st.file_uploader(
         "Выберите фотографию",
@@ -588,6 +589,75 @@ with tab_ai:
                     "Уверенность модели",
                     f"{confidence:.1f}%",
                 )
+
+                
+                st.markdown("### 📊 Оценка повреждений")
+
+                detections_count = result.get(
+                    "detections_count", 0
+                )
+
+                coverage = result.get(
+                    "coverage_percent", 0
+                )
+
+                severity_score = result.get(
+                    "severity_score", 0
+                )
+
+                severity_label = result.get(
+                    "severity_label", "Не определена"
+                )
+
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    st.metric(
+                        "Найдено дефектов",
+                        detections_count,
+                    )
+
+                with col2:
+                    st.metric(
+                        "Охват фотографии",
+                        f"{coverage:.1f}%",
+                    )
+
+                with col3:
+                    st.metric(
+                        "Визуальная оценка",
+                        f"{severity_score}/10"
+                        if detections_count > 0
+                        else "—",
+                    )
+
+                if detections_count > 0:
+                    if severity_score >= 8:
+                        st.error(
+                            "🔴 Высокая визуальная серьёзность"
+                        )
+                    elif severity_score >= 5:
+                        st.warning(
+                            "🟠 Средняя визуальная серьёзность"
+                        )
+                    else:
+                        st.success(
+                            "🟢 Низкая визуальная серьёзность"
+                        )
+                else:
+                    st.info(
+                        "Модель не обнаружила повреждений. "
+                        "Это не гарантирует, что дорога безопасна."
+                    )
+
+                st.caption(
+                    "Оценка приблизительная: "
+                    "основана на размере выделенных областей "
+                    "и количестве обнаружений. "
+                    "Не измеряет реальную площадь, "
+                    "глубину или риск ДТП."
+                )
+
 
                 if result["annotated_image"] is not None:
                     st.image(
