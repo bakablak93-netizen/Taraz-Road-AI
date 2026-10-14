@@ -1,33 +1,25 @@
 
-import csv
-import io
-import inspect
+import hashlib
 import os
 import uuid
-from datetime import datetime
+from io import BytesIO
+from pathlib import Path
 
+import folium
 import pandas as pd
 import streamlit as st
-import folium
-
-from services.detection import (
-    detect_road_damage,
-    model_available,
-)
+from PIL import Image, ImageOps
+from streamlit_folium import st_folium
+from streamlit_geolocation import streamlit_geolocation
+import re
+import hmac
 
 from services.database import (
-    init_db,
-    add_report,
-    list_reports,
-    get_report,
-    update_status,
-    add_vote,
-    add_comment,
-    list_comments,
-    list_status_history,
-    save_after_photo,
-    delete_report,
+    init_db, add_report, list_reports, get_report, update_status,
+    add_vote, add_comment, list_comments, list_status_history,
+    save_after_photo, delete_report,
 )
+from services.detection import detect_road_damage
 
 
 # ============================================================
@@ -38,19 +30,123 @@ st.set_page_config(
     page_title="Taraz Road AI",
     page_icon="🛣️",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
 init_db()
 
-if "voter_token" not in st.session_state:
-    st.session_state.voter_token = str(uuid.uuid4())
 
-if "upload_version" not in st.session_state:
-    st.session_state.upload_version = 0
+# ============================================================
+# СОВРЕМЕННЫЙ ДИЗАЙН
+# ============================================================
+
+st.markdown("""
+<style>
+    .stApp {
+        background:
+            radial-gradient(
+                ellipse at top right,
+                rgba(19, 92, 116, 0.13),
+                transparent 45%
+            ),
+            #0b1220;
+    }
+
+    .block-container {
+        max-width: 1420px;
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+    }
+
+    h1, h2, h3 {
+        letter-spacing: -0.6px;
+    }
+
+    [data-testid="stSidebar"] {
+        background: #111e31;
+        border-right: 1px solid #24354d;
+    }
+
+    [data-testid="stMetric"] {
+        background: #142238;
+        border: 1px solid #263a54;
+        border-radius: 16px;
+        padding: 18px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.09);
+    }
+
+    [data-testid="stMetricValue"] {
+        color: #65dbc0;
+        font-size: 30px;
+        font-weight: 700;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border-radius: 16px;
+    }
+
+    div.stButton > button {
+        border-radius: 10px;
+        font-weight: 600;
+        transition: 0.2s ease;
+    }
+
+    div.stButton > button[kind="primary"] {
+        background: #14a88b;
+        color: white;
+        border: none;
+    }
+
+    div.stButton > button[kind="primary"]:hover {
+        background: #0e8a72;
+        color: white;
+    }
+
+    [data-baseweb="tab-list"] {
+        gap: 10px;
+        margin-bottom: 18px;
+    }
+
+    button[data-baseweb="tab"] {
+        border-radius: 10px 10px 0 0;
+        padding: 12px 16px;
+    }
+
+    button[data-baseweb="tab"][aria-selected="true"] {
+        color: #65dbc0;
+    }
+
+    [data-testid="stFileUploader"],
+    [data-testid="stCameraInput"] {
+        border-radius: 14px;
+    }
+
+    .taraz-hero {
+        background: linear-gradient(
+            120deg,
+            #123e57,
+            #116d70
+        );
+        padding: 30px;
+        border-radius: 20px;
+        margin-bottom: 22px;
+        border: 1px solid #276e79;
+    }
+
+    .taraz-hero h1 {
+        margin: 0;
+        color: white;
+        font-size: 32px;
+    }
+
+    .taraz-hero p {
+        color: #d4f4ed;
+        margin: 12px 0 0;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
-ISSUE_TYPES = [
+ISSUES = [
     "Яма на дороге",
     "Трещины на дороге",
     "Повреждение тротуара",
@@ -64,376 +160,483 @@ ISSUE_TYPES = [
 
 STATUSES = [
     "Новая",
+    "На проверке",
     "На рассмотрении",
     "В работе",
     "Исправлено",
     "Отклонено",
 ]
 
-STATUS_COLORS = {
-    "Новая": "#e67e22",
-    "На рассмотрении": "#3498db",
-    "В работе": "#8e44ad",
-    "Исправлено": "#27ae60",
-    "Отклонено": "#7f8c8d",
-}
+if "voter_token" not in st.session_state:
+    st.session_state.voter_token = str(uuid.uuid4())
+
+if "upload_key" not in st.session_state:
+    st.session_state.upload_key = 0
 
 
 # ============================================================
-# СТИЛЬ
+# ФУНКЦИИ РАБОТЫ С ФОТО
 # ============================================================
 
-st.markdown(
-    """
-    <style>
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 3rem;
-    }
+def photo_bytes(upload):
+    """Поворачиваем фото с телефона и сохраняем как JPEG."""
 
-    .hero {
-        padding: 24px;
-        border-radius: 18px;
-        background: linear-gradient(120deg, #143b66, #177a89);
-        color: white;
-        margin-bottom: 20px;
-    }
+    image = Image.open(BytesIO(upload.getvalue()))
 
-    .hero h1 {
-        color: white;
-        margin: 0;
-        font-size: 2.1rem;
-    }
+    image = ImageOps.exif_transpose(image).convert("RGB")
 
-    .hero p {
-        margin: 10px 0 0 0;
-        font-size: 1rem;
-        opacity: 0.95;
-    }
+    image.thumbnail((1800, 1800))
 
-    .report-title {
-        font-size: 1.15rem;
-        font-weight: 700;
-        margin-bottom: 5px;
-    }
+    output = BytesIO()
 
-    .muted {
-        color: #888;
-        font-size: 0.88rem;
-    }
-
-    div[data-testid="stMetric"] {
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        border-radius: 12px;
-        padding: 12px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================
-
-def as_dict(item):
-    """Преобразует запись SQLite или словарь в обычный dict."""
-    if item is None:
-        return {}
-
-    if isinstance(item, dict):
-        return item
-
-    try:
-        return dict(item)
-    except Exception:
-        return {}
-
-
-def call_database(func, **values):
-    """
-    Передаёт только те аргументы, которые поддерживает функция.
-    Это помогает сохранить совместимость с database.py.
-    """
-    signature = inspect.signature(func)
-    parameters = signature.parameters
-
-    if any(
-        p.kind == inspect.Parameter.VAR_KEYWORD
-        for p in parameters.values()
-    ):
-        return func(**values)
-
-    accepted = {
-        name: value
-        for name, value in values.items()
-        if name in parameters
-    }
-
-    return func(**accepted)
-
-
-def load_reports(sort_by="priority"):
-    try:
-        data = list_reports(sort_by=sort_by)
-    except TypeError:
-        data = list_reports()
-
-    reports = [as_dict(item) for item in data]
-
-    if sort_by == "newest":
-        reports.sort(
-            key=lambda x: str(x.get("created_at") or ""),
-            reverse=True,
-        )
-    elif sort_by == "popular":
-        reports.sort(
-            key=lambda x: int(x.get("votes_count") or 0),
-            reverse=True,
-        )
-    else:
-        reports.sort(
-            key=lambda x: (
-                float(x.get("priority_score") or 0),
-                int(x.get("votes_count") or 0),
-            ),
-            reverse=True,
-        )
-
-    return reports
-
-
-def get_report_safe(report_id):
-    try:
-        result = get_report(int(report_id))
-        return as_dict(result)
-    except Exception:
-        for report in load_reports():
-            if int(report.get("id") or 0) == int(report_id):
-                return report
-
-    return {}
-
-
-def image_bytes(uploaded_file):
-    if uploaded_file is None:
-        return None
-    return uploaded_file.getvalue()
-
-
-def display_image(path, caption=None):
-    if not path:
-        return
-
-    if os.path.exists(str(path)):
-        st.image(str(path), caption=caption, use_container_width=True)
-
-
-def status_badge(status):
-    color = STATUS_COLORS.get(status, "#64748b")
-
-    st.markdown(
-        f"""
-        <span style="
-            background:{color};
-            color:white;
-            padding:5px 11px;
-            border-radius:20px;
-            font-size:13px;
-            font-weight:600;
-        ">{status}</span>
-        """,
-        unsafe_allow_html=True,
+    image.save(
+        output,
+        format="JPEG",
+        quality=88,
     )
 
-
-def format_date(value):
-    if not value:
-        return "Дата не указана"
-
-    return str(value).replace("T", " ")[:16]
+    return output.getvalue()
 
 
-def calculate_priority(severity, confidence=0.75):
-    """Предварительный балл срочности от 0 до 100."""
-    score = severity * 8 + confidence * 20
-    return round(min(100, max(0, score)), 1)
+def detected_type(label):
+    """Преобразуем название класса ИИ в тип проблемы."""
+
+    label = str(label).lower()
+
+    if (
+        "яма" in label
+        or "pothole" in label
+        or "d40" in label
+    ):
+        return "Яма на дороге"
+
+    if (
+        "трещин" in label
+        or "crack" in label
+        or "d00" in label
+        or "d10" in label
+        or "d20" in label
+    ):
+        return "Трещины на дороге"
+
+    return None
 
 
-def priority_label(score, votes=0):
-    score = float(score or 0)
-    votes = int(votes or 0)
+# ============================================================
+# AI-АНАЛИЗ ФОТОГРАФИИ
+# ============================================================
 
-    adjusted = min(100, score + min(votes * 2, 20))
+def ai_for_photo(data):
+    """
+    Анализируем фото только один раз.
+    Повторный ввод адреса не запускает ИИ заново.
+    """
 
-    if adjusted >= 75:
-        return "🔴 Высокая"
-    if adjusted >= 45:
-        return "🟠 Средняя"
-    return "🟢 Низкая"
+    signature = hashlib.sha256(data).hexdigest()
 
+    if st.session_state.get("ai_photo_hash") != signature:
 
-def render_comments(report_id):
-    st.markdown("**Комментарии жителей**")
+        with st.spinner(
+            "ИИ анализирует фотографию. "
+            "Первый запуск может быть долгим..."
+        ):
+            result = detect_road_damage(data)
 
-    try:
-        comments = list_comments(report_id)
-    except Exception as exc:
-        st.warning(f"Не удалось загрузить комментарии: {exc}")
-        comments = []
+        st.session_state.ai_photo_hash = signature
+        st.session_state.ai_result = result
 
-    if not comments:
-        st.caption("Пока нет комментариев.")
+        if result.get("mode") == "ai":
+            suggestion = detected_type(result.get("label"))
+        else:
+            suggestion = None
 
-    for item in comments:
-        comment = as_dict(item)
-
-        author = (
-            comment.get("author")
-            or comment.get("author_name")
-            or comment.get("name")
-            or "Житель"
+        st.session_state.issue_type = (
+            suggestion or "Другая проблема"
         )
 
-        message = (
-            comment.get("comment")
-            or comment.get("text")
-            or comment.get("content")
-            or ""
+        score = result.get("severity_score")
+
+        st.session_state.issue_severity = max(
+            1,
+            min(10, int(score or 5)),
         )
 
-        date = format_date(comment.get("created_at"))
+    return st.session_state.ai_result
 
-        st.markdown(f"**{author}** · {date}")
-        st.write(message)
 
-    with st.form(f"comment_form_{report_id}", clear_on_submit=True):
-        author = st.text_input(
-            "Ваше имя",
-            value="Житель Тараза",
-            key=f"author_{report_id}",
+def show_ai(result, show_photo=False):
+    """Показывает результаты анализа ИИ."""
+
+    if result.get("mode") != "ai":
+
+        st.info(
+            "ИИ временно недоступен. "
+            "Можно заполнить обращение вручную."
         )
 
-        message = st.text_area(
-            "Ваш комментарий",
-            max_chars=500,
-            key=f"message_{report_id}",
-        )
+        if result.get("error"):
+            st.caption(str(result["error"]))
 
-        submitted = st.form_submit_button("Отправить комментарий")
-
-        if submitted:
-            if not message.strip():
-                st.warning("Напишите комментарий.")
-            else:
-                try:
-                    call_database(
-                        add_comment,
-                        report_id=report_id,
-                        author=author.strip() or "Житель",
-                        author_name=author.strip() or "Житель",
-                        name=author.strip() or "Житель",
-                        comment=message.strip(),
-                        text=message.strip(),
-                        content=message.strip(),
-                    )
-
-                    st.success("Комментарий добавлен.")
-                    st.rerun()
-
-                except Exception as exc:
-                    st.error(f"Ошибка добавления комментария: {exc}")
-
-
-def render_history(report_id):
-    try:
-        history = list_status_history(report_id)
-    except Exception:
-        history = []
-
-    if not history:
-        st.caption("История изменений пока пуста.")
         return
 
-    for item in history:
-        event = as_dict(item)
+    count = int(
+        result.get("detections_count") or 0
+    )
 
-        old_status = event.get("old_status") or "—"
-        new_status = event.get("new_status") or event.get("status") or "—"
-        date = format_date(event.get("created_at"))
+    if count == 0:
 
-        st.write(f"🕒 {date}: {old_status} → **{new_status}**")
+        st.info(
+            "ИИ не обнаружил повреждений. "
+            "Это не гарантирует отсутствие проблемы."
+        )
+
+        return
+
+    st.success(
+        "🤖 ИИ обнаружил: "
+        + str(result.get("label", "Дефект"))
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "Найдено",
+        count,
+    )
+
+    c2.metric(
+        "Уверенность",
+        f"{float(result.get('confidence') or 0):.0%}",
+    )
+
+    c3.metric(
+        "Визуальная оценка",
+        f"{result.get('severity_score', '?')}/10",
+    )
+
+    st.caption(
+        f"Охват рамками: "
+        f"{result.get('coverage_percent', 0)}% изображения. "
+        "Это не реальная площадь ямы "
+        "и не точная оценка опасности."
+    )
+
+    if (
+        show_photo
+        and result.get("annotated_image") is not None
+    ):
+
+        st.image(
+            result["annotated_image"],
+            caption="Повреждения, отмеченные моделью",
+        )
 
 
-def render_report_card(report, show_comments=True):
-    report_id = report.get("id")
-    issue = report.get("defect_type") or "Проблема на дороге"
-    address = report.get("address") or "Адрес не указан"
-    status = report.get("status") or "Новая"
-    votes = int(report.get("votes_count") or 0)
-    score = float(report.get("priority_score") or 0)
+# ============================================================
+# ФУНКЦИИ ОТОБРАЖЕНИЯ ОБРАЩЕНИЙ
+# ============================================================
+
+def show_photo(path, title="Фото"):
+
+    if path and Path(str(path)).is_file():
+
+        st.image(
+            str(path),
+            caption=title,
+            width="stretch",
+        )
+
+    else:
+        st.caption("Фотография недоступна")
+
+
+def show_history(report_id):
+
+    rows = list_status_history(report_id)
+
+    if not rows:
+        st.caption("Изменений пока нет")
+
+    for row in rows:
+
+        old = row.get("old_status") or "Создано"
+
+        st.write(
+            f"{row.get('changed_at', '')}: "
+            f"{old} → {row.get('new_status', '')}"
+        )
+
+
+# ============================================================
+# РЕЙТИНГ ПРОБЛЕМНЫХ ДОРОГ
+# ============================================================
+
+def road_name(address):
+    """
+    Пытается выделить улицу из введённого адреса.
+    """
+
+    address = " ".join(
+        str(address or "").strip().split()
+    )
+
+    if not address:
+        return "Адрес не указан"
+
+    match = re.search(
+        r"(?:улица|ул\.?|проспект|пр-т|шоссе|"
+        r"переулок|бульвар)\s+([^,;]+)",
+        address,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        street = match.group(0).strip()
+
+        street = re.sub(
+            r"\s+(?:дом|д\.)?\s*\d+[а-яa-z]?$",
+            "",
+            street,
+            flags=re.IGNORECASE,
+        )
+
+        return street.strip()
+
+    return address.split(",")[-1].strip() or address
+
+
+def top_roads(reports):
+    """
+    Рейтинг по активным обращениям.
+
+    Учитываем:
+    - максимальную срочность обращения
+    - количество обращений
+    - поддержку жителей
+    """
+
+    groups = {}
+
+    for report in reports:
+
+        if report.get("status") in (
+            "Исправлено",
+            "Отклонено",
+        ):
+            continue
+
+        name = road_name(
+            report.get("address")
+        )
+
+        if name == "Адрес не указан":
+            continue
+
+        key = name.casefold()
+
+        if key not in groups:
+
+            groups[key] = {
+                "Улица / участок": name,
+                "Заявок": 0,
+                "Голосов": 0,
+                "Макс. срочность": 0,
+                "Номера": [],
+            }
+
+        item = groups[key]
+
+        item["Заявок"] += 1
+
+        item["Голосов"] += int(
+            report.get("votes_count") or 0
+        )
+
+        item["Макс. срочность"] = max(
+            item["Макс. срочность"],
+            float(
+                report.get("priority_score") or 0
+            ),
+        )
+
+        item["Номера"].append(
+            str(report.get("id"))
+        )
+
+    ranking = []
+
+    for item in groups.values():
+
+        base = item["Макс. срочность"]
+
+        reports_bonus = min(
+            15,
+            item["Заявок"] * 3,
+        )
+
+        votes_bonus = min(
+            10,
+            item["Голосов"],
+        )
+
+        item["Рейтинг"] = round(
+            min(
+                100,
+                base + reports_bonus + votes_bonus,
+            ),
+            1,
+        )
+
+        item["Обращения"] = ", ".join(
+            "#" + number
+            for number in item.pop("Номера")
+        )
+
+        ranking.append(item)
+
+    ranking.sort(
+        key=lambda item: (
+            item["Рейтинг"],
+            item["Заявок"],
+        ),
+        reverse=True,
+    )
+
+    return ranking
+
+
+def show_report(report):
+
+    rid = int(report["id"])
 
     with st.container(border=True):
-        col_photo, col_info = st.columns([1, 2], gap="large")
 
-        with col_photo:
-            path = report.get("image_path")
+        left, right = st.columns([1, 2])
 
-            if path and os.path.exists(str(path)):
-                st.image(str(path), use_container_width=True)
-            else:
-                st.info("📷 Фото недоступно")
+        with left:
 
-            after_path = report.get("after_image_path")
+            show_photo(
+                report.get("image_path"),
+                "Фото проблемы",
+            )
 
-            if after_path and os.path.exists(str(after_path)):
-                with st.expander("Фото после ремонта"):
-                    st.image(str(after_path), use_container_width=True)
+        with right:
 
-        with col_info:
-            st.markdown(f"### #{report_id} · {issue}")
+            st.subheader(
+                f"#{rid} · "
+                f"{report.get('defect_type', 'Дефект')}"
+            )
 
-            st.write(f"📍 {address}")
-            st.caption(f"📅 {format_date(report.get('created_at'))}")
+            st.write(
+                "📍",
+                report.get("address") or "Адрес не указан",
+            )
 
-            status_badge(status)
+            st.write(
+                "**Статус:**",
+                report.get("status", "Новая"),
+            )
 
-            st.write("")
-            st.write(f"**Приоритет:** {priority_label(score, votes)}")
-            st.write(f"**Поддержали:** {votes} человек")
+            st.write(
+                "**Срочность:**",
+                report.get("priority_score", 0),
+                "/ 100",
+            )
+
+            st.caption(
+                "Создано: "
+                + str(report.get("created_at", ""))
+            )
+
+            if report.get("mode") == "ai":
+
+                st.caption(
+                    "🤖 Тип повреждения предложен моделью "
+                    "и подтверждён при отправке"
+                )
+
+            votes = int(
+                report.get("votes_count") or 0
+            )
 
             if st.button(
                 f"👍 Поддержать ({votes})",
-                key=f"vote_{report_id}",
+                key=f"vote_{rid}",
             ):
-                try:
-                    result = call_database(
-                        add_vote,
-                        report_id=report_id,
-                        voter_token=st.session_state.voter_token,
-                        voter_id=st.session_state.voter_token,
-                        token=st.session_state.voter_token,
-                    )
 
-                    if result is False:
-                        st.info("Вы уже поддержали это обращение.")
-                    else:
-                        st.success("Ваш голос учтён!")
+                ok, msg = add_vote(
+                    rid,
+                    st.session_state.voter_token,
+                )
 
+                if ok:
                     st.rerun()
 
-                except Exception as exc:
-                    st.warning(f"Не удалось проголосовать: {exc}")
+                else:
+                    st.info(msg)
 
-        if show_comments:
-            with st.expander(
-                f"💬 Комментарии · обращение #{report_id}"
+        # Фото после ремонта
+
+        if report.get("after_image_path"):
+
+            with st.expander("Фото после ремонта"):
+
+                show_photo(
+                    report["after_image_path"],
+                    "После ремонта",
+                )
+
+        # Комментарии
+
+        with st.expander(
+            f"💬 Комментарии "
+            f"({report.get('comments_count', 0)})"
+        ):
+
+            for comment in list_comments(rid):
+
+                st.write(
+                    f"**{comment['author']}**: "
+                    f"{comment['body']}"
+                )
+
+                st.caption(
+                    str(comment["created_at"])
+                )
+
+            with st.form(
+                f"comments_{rid}",
+                clear_on_submit=True,
             ):
-                render_comments(report_id)
 
-        with st.expander("📋 История обращения"):
-            render_history(report_id)
+                author = st.text_input(
+                    "Имя",
+                    value="Житель Тараза",
+                )
+
+                message = st.text_area(
+                    "Комментарий",
+                    max_chars=500,
+                )
+
+                if st.form_submit_button("Отправить"):
+
+                    ok, msg = add_comment(
+                        rid,
+                        message,
+                        author,
+                    )
+
+                    if ok:
+                        st.rerun()
+
+                    else:
+                        st.warning(msg)
+
+        # История
+
+        with st.expander("История статусов"):
+            show_history(rid)
 
 
 # ============================================================
@@ -441,83 +644,69 @@ def render_report_card(report, show_comments=True):
 # ============================================================
 
 with st.sidebar:
-    st.markdown("## 🛣️ Taraz Road AI")
-    st.caption("Умный город начинается с жителей")
 
-    st.divider()
+    st.markdown("""
+<div class="taraz-hero">
+    <h1>🛣️ Taraz Road AI</h1>
+    <p>
+        Умная система мониторинга дорог Тараза.
+        Сообщайте о повреждениях, отслеживайте ремонт
+        и помогайте сделать город безопаснее.
+    </p>
+</div>
+""", unsafe_allow_html=True)
 
-    st.write("**Как это работает?**")
-    st.write("1. Сообщите о проблеме.")
-    st.write("2. Укажите место и добавьте фото.")
-    st.write("3. Жители смогут поддержать обращение.")
-    st.write("4. Следите за статусом решения.")
-
-    st.divider()
-
-    st.caption("Прототип для Digital Taraz Hackathon")
-    st.caption("Город Тараз, Казахстан 🇰🇿")
+    st.caption("Digital Taraz · Прототип")
 
 
 # ============================================================
-# ЗАГОЛОВОК
+# ГЛАВНАЯ
 # ============================================================
 
-st.markdown(
-    """
-    <div class="hero">
-        <h1>🛣️ Taraz Road AI</h1>
-        <p>
-            Сообщайте о проблемах дорог, поддерживайте обращения
-            и следите за их решением.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
+st.title("🛣️ Taraz Road AI")
+
+st.write(
+    "Фото → анализ ИИ → местоположение "
+    "→ обращение → контроль ремонта"
 )
 
+reports = list_reports()
 
-reports = load_reports()
-
-total_reports = len(reports)
-
-completed_reports = sum(
-    1
-    for report in reports
-    if report.get("status") == "Исправлено"
+active = sum(
+    r.get("status") != "Исправлено"
+    for r in reports
 )
 
-active_reports = sum(
-    1
-    for report in reports
-    if report.get("status") in (
-        "Новая",
-        "На рассмотрении",
-        "В работе",
-    )
+fixed = sum(
+    r.get("status") == "Исправлено"
+    for r in reports
 )
 
-total_votes = sum(
-    int(report.get("votes_count") or 0)
-    for report in reports
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric("Всего обращений", len(reports))
+
+c2.metric("Активные", active)
+
+c3.metric("Исправлено", fixed)
+
+c4.metric(
+    "Голосов жителей",
+    sum(
+        int(r.get("votes_count") or 0)
+        for r in reports
+    ),
 )
-
-m1, m2, m3, m4 = st.columns(4)
-
-m1.metric("Всего обращений", total_reports)
-m2.metric("Активные", active_reports)
-m3.metric("Исправлено", completed_reports)
-m4.metric("Голосов жителей", total_votes)
-
-st.write("")
 
 
 # ============================================================
 # ВКЛАДКИ
 # ============================================================
 
-tab_ai, tab_new, tab_feed, tab_map, tab_track, tab_admin = st.tabs(
+# Отдельной вкладки AI больше нет!
+
+tab_new, tab_feed, tab_map, tab_status, tab_admin = st.tabs(
     [
-        "🤖 AI-анализ",
         "➕ Новое обращение",
         "📰 Лента проблем",
         "🗺️ Карта",
@@ -531,239 +720,391 @@ tab_ai, tab_new, tab_feed, tab_map, tab_track, tab_admin = st.tabs(
 # 1. НОВОЕ ОБРАЩЕНИЕ
 # ============================================================
 
-# ============================================================
-# AI-РАСПОЗНАВАНИЕ ДОРОЖНЫХ ДЕФЕКТОВ
-# ============================================================
-
-with tab_ai:
-    st.subheader("🤖 Распознавание дорожных повреждений")
-
-    st.write(
-        "Загрузите фотографию дороги. "
-        "ИИ попробует обнаружить повреждения."
-    )
-
-    if model_available():
-        st.success("✅ Модель загружена")
-    else:
-        st.info(
-            "🤖 Модель будет автоматически загружена "
-            "при первом анализе фотографии. "
-            "Первый запуск может занять некоторое время."
-    )
-
-    ai_image = st.file_uploader(
-        "Выберите фотографию",
-        type=["jpg", "jpeg", "png"],
-        key="ai_test_image",
-    )
-
-    if ai_image is not None:
-        st.image(
-            ai_image,
-            caption="Исходная фотография",
-            use_container_width=True,
-        )
-
-        if st.button(
-            "🔍 Анализировать фотографию",
-            type="primary",
-            key="start_ai_detection",
-        ):
-            with st.spinner("Анализ фотографии..."):
-                result = detect_road_damage(
-                    ai_image.getvalue()
-                )
-
-            if result["mode"] == "ai":
-                st.success("✅ Анализ завершён")
-
-                st.write(
-                    "**Обнаруженный дефект:**",
-                    result["label"],
-                )
-
-                confidence = result["confidence"] * 100
-
-                st.metric(
-                    "Уверенность модели",
-                    f"{confidence:.1f}%",
-                )
-
-                
-
-                if result["annotated_image"] is not None:
-                    st.image(
-                        result["annotated_image"],
-                        caption="Результат распознавания",
-                        use_container_width=True,
-                    )
-
-                if result["confidence"] < 0.5:
-                    st.warning(
-                        "Уверенность модели низкая. "
-                        "Рекомендуется ручная проверка."
-                    )
-
-            else:
-                st.info(
-                    "ИИ пока не выполняет распознавание. "
-                    "Для настоящего анализа нужна "
-                    "обученная модель YOLO."
-                )
-
-                if result.get("error"):
-                    st.error(result["error"])
-
 with tab_new:
-    st.subheader("Сообщить о проблеме")
 
-    st.write(
-        "Сфотографируйте проблему или выберите снимок "
-        "из галереи телефона."
+    st.subheader("1. Сделайте фото проблемы")
+
+    source_type = st.radio(
+        "Способ добавления фото",
+        [
+            "📷 Камера телефона",
+            "🖼️ Галерея / файл",
+        ],
+        horizontal=True,
     )
 
-    with st.form(
-        f"new_report_form_{st.session_state.upload_version}"
-    ):
-        uploaded_image = st.file_uploader(
-            "📷 Фотография проблемы",
-            type=["jpg", "jpeg", "png"],
-            help="Можно выбрать фотографию с телефона или компьютера.",
+    photo_key = (
+        f"photo_{st.session_state.upload_key}"
+    )
+
+    # Камера телефона
+
+    if source_type.startswith("📷"):
+
+        source = st.camera_input(
+            "Сфотографировать повреждение",
+            key=photo_key + "_camera",
         )
 
-        issue_type = st.selectbox(
-            "Тип проблемы",
-            ISSUE_TYPES,
+    # Галерея телефона / файл компьютера
+
+    else:
+
+        source = st.file_uploader(
+            "Выбрать фотографию",
+            type=[
+                "jpg",
+                "jpeg",
+                "png",
+                "webp",
+            ],
+            key=photo_key + "_gallery",
         )
 
-        address = st.text_input(
-            "📍 Адрес или ориентир",
-            placeholder="Например: Тараз, проспект Абая, возле остановки",
-        )
+    data = None
+    analysis = None
+
+    # Автоматический ИИ-анализ
+
+    if source is not None:
+
+        try:
+
+            data = photo_bytes(source)
+
+            st.image(
+                data,
+                caption="Фото обращения",
+                width=450,
+            )
+
+            analysis = ai_for_photo(data)
+
+            show_ai(
+                analysis,
+                show_photo=True,
+            )
+
+        except Exception as exc:
+
+            st.error(
+                f"Не удалось обработать фото: {exc}"
+            )
+
+    # --------------------------------------------------------
+    # ТИП ПРОБЛЕМЫ
+    # --------------------------------------------------------
+
+    st.subheader("2. Проверьте описание проблемы")
+
+    if "issue_type" not in st.session_state:
+        st.session_state.issue_type = "Другая проблема"
+
+    if "issue_severity" not in st.session_state:
+        st.session_state.issue_severity = 5
+
+    defect_type = st.selectbox(
+        "Тип проблемы",
+        ISSUES,
+        key="issue_type",
+    )
+
+    severity = st.slider(
+        "Серьёзность (можно исправить оценку ИИ)",
+        1,
+        10,
+        key="issue_severity",
+    )
+
+    # --------------------------------------------------------
+    # ГЕОЛОКАЦИЯ
+    # --------------------------------------------------------
+
+    st.subheader("3. Укажите местоположение")
+
+    location_mode = st.radio(
+        "Как указать место?",
+        [
+            "📍 GPS телефона",
+            "🗺️ Выбрать на карте",
+            "✍️ Координаты",
+            "🏠 Только адрес",
+        ],
+        horizontal=True,
+    )
+
+    lat = 0.0
+    lon = 0.0
+
+    # GPS
+
+    if location_mode.startswith("📍"):
 
         st.caption(
-            "Координаты необязательны. "
-            "Если знаете точку на карте, укажите её ниже."
+            "Разрешите браузеру доступ к местоположению. "
+            "Работает на HTTPS или localhost."
         )
 
-        col_lat, col_lon = st.columns(2)
+        gps = streamlit_geolocation()
 
-        with col_lat:
-            latitude = st.number_input(
-                "Широта",
-                min_value=-90.0,
-                max_value=90.0,
-                value=42.9000,
-                format="%.6f",
+        if (
+            isinstance(gps, dict)
+            and gps.get("latitude") is not None
+            and gps.get("longitude") is not None
+        ):
+
+            st.session_state.last_lat = float(
+                gps["latitude"]
             )
 
-        with col_lon:
-            longitude = st.number_input(
-                "Долгота",
-                min_value=-180.0,
-                max_value=180.0,
-                value=71.3667,
-                format="%.6f",
+            st.session_state.last_lon = float(
+                gps["longitude"]
             )
 
-        severity = st.slider(
-            "Насколько серьёзная проблема?",
-            min_value=1,
-            max_value=10,
-            value=5,
-            help="1 — небольшая проблема, 10 — опасная ситуация.",
-        )
+        if (
+            "last_lat" in st.session_state
+            and "last_lon" in st.session_state
+        ):
 
-        st.write("**Насколько опасна эта проблема?**")
+            lat = st.session_state.last_lat
+            lon = st.session_state.last_lon
 
-        danger = st.radio(
-            "Оценка опасности",
-            [
-                "Не очень опасно",
-                "Мешает движению",
-                "Может привести к аварии",
-            ],
-            horizontal=True,
-        )
-
-        confirmed = st.checkbox(
-            "Я подтверждаю, что информация соответствует действительности."
-        )
-
-        submit_report = st.form_submit_button(
-            "🚀 Отправить обращение",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if submit_report:
-        if uploaded_image is None:
-            st.error("Добавьте фотографию проблемы.")
-
-        elif not address.strip():
-            st.error("Укажите адрес или ориентир.")
-
-        elif not confirmed:
-            st.error("Подтвердите достоверность информации.")
+            st.success(
+                f"GPS: {lat:.6f}, {lon:.6f}"
+            )
 
         else:
+
+            st.warning(
+                "GPS не получен. Выбери точку "
+                "на карте либо введи адрес."
+            )
+
+    # ВЫБОР ТОЧКИ НА КАРТЕ
+
+    elif location_mode.startswith("🗺️"):
+
+        center = [
+            st.session_state.get(
+                "last_lat",
+                42.9000,
+            ),
+            st.session_state.get(
+                "last_lon",
+                71.3667,
+            ),
+        ]
+
+        map_choose = folium.Map(
+            location=center,
+            zoom_start=13,
+        )
+
+        result_map = st_folium(
+            map_choose,
+            height=340,
+            use_container_width=True,
+            returned_objects=["last_clicked"],
+            key="choose_location",
+        )
+
+        point = (
+            result_map or {}
+        ).get("last_clicked")
+
+        if point:
+
+            st.session_state.last_lat = float(
+                point["lat"]
+            )
+
+            st.session_state.last_lon = float(
+                point["lng"]
+            )
+
+        if (
+            "last_lat" in st.session_state
+            and "last_lon" in st.session_state
+        ):
+
+            lat = st.session_state.last_lat
+            lon = st.session_state.last_lon
+
+            st.success(
+                f"Выбрано: {lat:.6f}, {lon:.6f}"
+            )
+
+        else:
+
+            st.info(
+                "Нажми на нужное место на карте."
+            )
+
+    # РУЧНЫЕ КООРДИНАТЫ
+
+    elif location_mode.startswith("✍️"):
+
+        a, b = st.columns(2)
+
+        txt_lat = a.text_input(
+            "Широта",
+            placeholder="42.900000",
+        )
+
+        txt_lon = b.text_input(
+            "Долгота",
+            placeholder="71.366700",
+        )
+
+        if txt_lat.strip() and txt_lon.strip():
+
             try:
-                image_data = image_bytes(uploaded_image)
 
-                adjusted_severity = severity
-
-                if danger == "Мешает движению":
-                    adjusted_severity = min(10, severity + 1)
-                elif danger == "Может привести к аварии":
-                    adjusted_severity = min(10, severity + 2)
-
-                confidence = 0.75
-
-                score = calculate_priority(
-                    adjusted_severity,
-                    confidence,
+                lat = float(
+                    txt_lat.replace(",", ".")
                 )
 
-                result = call_database(
-                    add_report,
-                    image_bytes=image_data,
-                    image_data=image_data,
-                    image=image_data,
-                    uploaded_file=image_data,
-                    filename=uploaded_image.name,
-                    image_name=uploaded_image.name,
-                    defect_type=issue_type,
+                lon = float(
+                    txt_lon.replace(",", ".")
+                )
+
+            except ValueError:
+
+                st.warning(
+                    "Координаты должны быть числами"
+                )
+
+    # АДРЕС
+
+    address = st.text_input(
+        "Адрес или ориентир",
+        placeholder="Тараз, улица, дом или ориентир",
+    )
+
+    if lat == 0 and lon == 0:
+
+        st.caption(
+            "Точка на карте не будет создана "
+            "без реальных координат."
+        )
+
+    agreed = st.checkbox(
+        "Подтверждаю достоверность обращения"
+    )
+
+    # --------------------------------------------------------
+    # СОХРАНЕНИЕ
+    # --------------------------------------------------------
+
+    if st.button(
+        "🚀 Отправить обращение",
+        type="primary",
+        width="stretch",
+    ):
+
+        if data is None:
+
+            st.error("Добавь фотографию")
+
+        elif not address.strip():
+
+            st.error("Укажи адрес")
+
+        elif not agreed:
+
+            st.error(
+                "Подтверди достоверность информации"
+            )
+
+        elif not (
+            -90 <= lat <= 90
+            and -180 <= lon <= 180
+        ):
+
+            st.error("Недопустимые координаты")
+
+        else:
+
+            if (
+                analysis
+                and analysis.get("mode") == "ai"
+            ):
+
+                suggestion = detected_type(
+                    analysis.get("label")
+                )
+
+            else:
+                suggestion = None
+
+            ai_used = bool(
+                suggestion
+                and suggestion == defect_type
+                and int(
+                    analysis.get("detections_count") or 0
+                ) > 0
+            )
+
+            if ai_used:
+
+                confidence = float(
+                    analysis.get("confidence") or 0
+                )
+
+            else:
+                confidence = 0.0
+
+            priority = min(
+                100,
+                round(
+                    severity * 8
+                    + confidence * 20
+                ),
+            )
+
+            try:
+
+                rid, duplicate = add_report(
+                    image_bytes=data,
+                    defect_type=defect_type,
                     confidence=confidence,
-                    latitude=latitude,
-                    longitude=longitude,
+                    latitude=lat,
+                    longitude=lon,
                     address=address.strip(),
-                    severity=adjusted_severity,
-                    priority_score=score,
-                    mode="manual",
+                    severity=severity,
+                    priority_score=priority,
+                    mode="ai" if ai_used else "manual",
                 )
 
-                if result is False:
-                    st.warning(
-                        "Похожее обращение уже было отправлено недавно."
-                    )
-                else:
-                    st.success(
-                        "Обращение отправлено! "
-                        "Теперь оно появится в общей ленте."
-                    )
-                    st.balloons()
+                if duplicate:
 
-                    st.session_state.upload_version += 1
+                    st.info(
+                        f"Похожая заявка уже создана: #{rid}"
+                    )
+
+                else:
+
+                    st.success(
+                        f"Обращение #{rid} сохранено!"
+                    )
+
+                    st.session_state.upload_key += 1
+
+                    st.session_state.pop(
+                        "ai_photo_hash",
+                        None,
+                    )
+
+                    st.session_state.pop(
+                        "ai_result",
+                        None,
+                    )
 
             except Exception as exc:
-                st.error(f"Не удалось сохранить обращение: {exc}")
 
-    st.info(
-        "ℹ️ Сейчас тип проблемы выбирается вручную. "
-        "Автоматическое распознавание появится при подключении "
-        "обученной модели road_damage.pt."
-    )
+                st.error(
+                    f"Ошибка сохранения: {exc}"
+                )
 
 
 # ============================================================
@@ -771,484 +1112,707 @@ with tab_new:
 # ============================================================
 
 with tab_feed:
-    st.subheader("Проблемы, о которых сообщили жители")
 
-    filter_col, sort_col, search_col = st.columns([1, 1, 2])
+    st.subheader("Обращения жителей")
 
-    with filter_col:
-        status_filter = st.selectbox(
-            "Статус",
-            ["Все"] + STATUSES,
-            key="feed_status_filter",
-        )
+    a, b, c = st.columns([1, 1, 2])
 
-    with sort_col:
-        sort_label = st.selectbox(
-            "Сортировка",
-            [
-                "Сначала срочные",
-                "Сначала новые",
-                "Самые популярные",
-            ],
-        )
-
-    with search_col:
-        search_query = st.text_input(
-            "Поиск",
-            placeholder="Адрес, тип проблемы или номер",
-        )
-
-    sort_values = {
-        "Сначала срочные": "priority",
-        "Сначала новые": "newest",
-        "Самые популярные": "popular",
-    }
-
-    filtered_reports = load_reports(
-        sort_values[sort_label]
+    status_filter = a.selectbox(
+        "Статус",
+        ["Все"] + STATUSES,
     )
 
-    if status_filter != "Все":
-        filtered_reports = [
-            report
-            for report in filtered_reports
-            if report.get("status") == status_filter
-        ]
-
-    if search_query.strip():
-        query = search_query.lower().strip()
-
-        filtered_reports = [
-            report
-            for report in filtered_reports
-            if (
-                query in str(report.get("id") or "").lower()
-                or query in str(report.get("address") or "").lower()
-                or query in str(report.get("defect_type") or "").lower()
-            )
-        ]
-
-    st.caption(
-        f"Найдено обращений: {len(filtered_reports)}"
+    sort = b.selectbox(
+        "Сортировка",
+        [
+            "Срочные",
+            "Новые",
+            "Популярные",
+        ],
     )
 
-    if not filtered_reports:
-        st.info("По вашему запросу обращений пока нет.")
+    query = c.text_input(
+        "Поиск по номеру, адресу или типу"
+    )
 
-    for report in filtered_reports:
-        render_report_card(report)
+    sort_key = {
+        "Срочные": "priority",
+        "Новые": "newest",
+        "Популярные": "popular",
+    }[sort]
+
+    rows = list_reports(
+        sort_by=sort_key
+    )
+
+    for report in rows:
+
+        if (
+            status_filter != "Все"
+            and report.get("status") != status_filter
+        ):
+            continue
+
+        searchable = (
+            str(report.get("id", ""))
+            + " "
+            + str(report.get("address", ""))
+            + " "
+            + str(report.get("defect_type", ""))
+        ).lower()
+
+        if query and query.lower() not in searchable:
+            continue
+
+        show_report(report)
 
 
 # ============================================================
-# 3. КАРТА ПРОБЛЕМ
+# 3. КАРТА
 # ============================================================
 
 with tab_map:
-    st.subheader("Карта дорожных проблем Тараза")
 
-    st.caption(
-        "Красный — высокая срочность, "
-        "оранжевый — средняя, зелёный — низкая."
-    )
+    st.subheader("Карта дорожных проблем")
 
-    map_status = st.selectbox(
-        "Показать на карте",
+    status_for_map = st.selectbox(
+        "Статус на карте",
         ["Все"] + STATUSES,
-        key="map_status_filter",
     )
-
-    map_reports = load_reports()
-
-    if map_status != "Все":
-        map_reports = [
-            report
-            for report in map_reports
-            if report.get("status") == map_status
-        ]
 
     road_map = folium.Map(
         location=[42.9000, 71.3667],
         zoom_start=12,
-        tiles="OpenStreetMap",
     )
 
-    marker_count = 0
+    markers = 0
 
-    for report in map_reports:
-        lat = report.get("latitude")
-        lon = report.get("longitude")
+    for report in reports:
 
-        if lat is None or lon is None:
+        if (
+            status_for_map != "Все"
+            and report.get("status") != status_for_map
+        ):
             continue
 
-        try:
-            lat = float(lat)
-            lon = float(lon)
-        except (TypeError, ValueError):
-            continue
-
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            continue
-
-        score = float(report.get("priority_score") or 0)
-        votes = int(report.get("votes_count") or 0)
-
-        adjusted_score = min(100, score + min(votes * 2, 20))
-
-        if adjusted_score >= 75:
-            marker_color = "red"
-        elif adjusted_score >= 45:
-            marker_color = "orange"
-        else:
-            marker_color = "green"
-
-        popup_text = (
-            f"Обращение #{report.get('id')}\n"
-            f"{report.get('defect_type')}\n"
-            f"{report.get('address')}\n"
-            f"Статус: {report.get('status')}\n"
-            f"Поддержали: {votes}"
+        lat = float(
+            report.get("latitude") or 0
         )
 
+        lon = float(
+            report.get("longitude") or 0
+        )
+
+        if not (
+            -90 <= lat <= 90
+            and -180 <= lon <= 180
+        ):
+            continue
+
+        if lat == 0 and lon == 0:
+            continue
+
+        priority = float(
+            report.get("priority_score") or 0
+        )
+
+        if priority >= 75:
+            color = "red"
+
+        elif priority >= 45:
+            color = "orange"
+
+        else:
+            color = "green"
+
         folium.Marker(
-            location=[lat, lon],
-            tooltip=f"Обращение #{report.get('id')}",
+            [lat, lon],
+            tooltip=f"Обращение #{report['id']}",
             popup=folium.Popup(
-                popup_text.replace("\n", "<br>"),
-                max_width=300,
+                f"#{report['id']} · "
+                f"{report.get('defect_type')} · "
+                f"{report.get('status')}",
+                max_width=260,
             ),
             icon=folium.Icon(
-                color=marker_color,
-                icon="info-sign",
+                color=color
             ),
         ).add_to(road_map)
 
-        marker_count += 1
+        markers += 1
 
-    st.components.v1.html(
-        road_map._repr_html_(),
-        height=540,
-        scrolling=False,
+    st_folium(
+        road_map,
+        height=520,
+        use_container_width=True,
+        key="main_map",
     )
 
-    st.caption(f"На карте отмечено: {marker_count}")
+    st.caption(
+        f"Точек на карте: {markers}. "
+        "Красный — срочно, "
+        "оранжевый — средне, "
+        "зелёный — ниже."
+    )
 
 
 # ============================================================
 # 4. ПРОВЕРКА СТАТУСА
 # ============================================================
 
-with tab_track:
-    st.subheader("Проверить статус обращения")
+with tab_status:
 
-    st.write(
-        "Введите номер обращения, чтобы узнать, "
-        "что с ним происходит."
+    st.subheader(
+        "Проверить статус обращения"
     )
 
-    report_number = st.number_input(
+    rid = st.number_input(
         "Номер обращения",
         min_value=1,
         step=1,
         value=1,
     )
 
-    if st.button(
-        "🔎 Найти обращение",
-        type="primary",
-    ):
-        report = get_report_safe(report_number)
+    if st.button("🔎 Найти"):
 
-        if not report:
-            st.warning("Обращение с таким номером не найдено.")
+        report = get_report(rid)
+
+        if report:
+            show_report(report)
+
         else:
-            st.session_state.tracked_report_id = int(report_number)
-
-    tracked_id = st.session_state.get("tracked_report_id")
-
-    if tracked_id:
-        tracked_report = get_report_safe(tracked_id)
-
-        if tracked_report:
-            render_report_card(tracked_report)
+            st.warning(
+                "Обращение не найдено"
+            )
 
 
 # ============================================================
 # 5. ПАНЕЛЬ АДМИНИСТРАТОРА
 # ============================================================
 
-with tab_admin:
-    st.subheader("Панель администратора")
 
-    st.warning(
-        "⚠️ Демонстрационный режим: пока нет авторизации. "
-        "Для реального запуска доступ к этому разделу "
-        "необходимо защитить."
+# ============================================================
+# НОВАЯ ПАНЕЛЬ АДМИНИСТРАТОРА
+# ============================================================
+
+with tab_admin:
+
+    st.subheader(
+        "Панель управления городскими обращениями"
     )
 
-    admin_reports = load_reports()
+    secret = os.environ.get(
+        "ADMIN_PASSWORD",
+        "",
+    )
 
-    st.markdown("### 📊 Статистика")
-
-    if admin_reports:
-        status_counts = pd.DataFrame(
-            [
-                {
-                    "Статус": report.get("status") or "Новая",
-                    "Количество": 1,
-                }
-                for report in admin_reports
-            ]
-        )
-
-        status_counts = (
-            status_counts
-            .groupby("Статус", as_index=False)["Количество"]
-            .sum()
-        )
-
-        st.bar_chart(
-            status_counts.set_index("Статус")
-        )
-
-        type_counts = pd.DataFrame(
-            [
-                {
-                    "Тип": report.get("defect_type") or "Другое",
-                    "Количество": 1,
-                }
-                for report in admin_reports
-            ]
-        )
-
-        type_counts = (
-            type_counts
-            .groupby("Тип", as_index=False)["Количество"]
-            .sum()
-        )
-
-        with st.expander("Статистика по типам проблем"):
-            st.bar_chart(
-                type_counts.set_index("Тип")
+    try:
+        secret = str(
+            st.secrets.get(
+                "ADMIN_PASSWORD",
+                secret,
             )
+        )
+    except Exception:
+        pass
 
-    else:
-        st.info("Пока нет данных для статистики.")
+    if not secret:
+
+        st.error(
+            "Для доступа добавь ADMIN_PASSWORD "
+            "в Streamlit Secrets."
+        )
+
+        st.stop()
+
+    password = st.text_input(
+        "Пароль администратора",
+        type="password",
+        key="admin_password",
+    )
+
+    if not hmac.compare_digest(password, secret):
+
+        st.info(
+            "Введите пароль администратора."
+        )
+
+        st.stop()
+
+    # --------------------------------------------------------
+    # ОБЩАЯ СТАТИСТИКА
+    # --------------------------------------------------------
+
+    active_reports = [
+        r for r in reports
+        if r.get("status") not in (
+            "Исправлено",
+            "Отклонено",
+        )
+    ]
+
+    critical_reports = [
+        r for r in active_reports
+        if float(
+            r.get("priority_score") or 0
+        ) >= 75
+    ]
+
+    roads = top_roads(reports)
+
+    m1, m2, m3, m4 = st.columns(4)
+
+    m1.metric(
+        "Всего обращений",
+        len(reports),
+    )
+
+    m2.metric(
+        "Ожидают решения",
+        len(active_reports),
+    )
+
+    m3.metric(
+        "Срочные обращения",
+        len(critical_reports),
+    )
+
+    m4.metric(
+        "Проблемных участков",
+        len(roads),
+    )
 
     st.divider()
 
-    st.markdown("### 📁 Экспорт обращений")
+    dashboard, ranking_tab, manage, export = st.tabs(
+        [
+            "📊 Аналитика",
+            "🚧 Топ дорог",
+            "🛠️ Управление",
+            "📥 Экспорт",
+        ]
+    )
 
-    if admin_reports:
-        export_rows = []
+    # ========================================================
+    # АНАЛИТИКА
+    # ========================================================
 
-        for report in admin_reports:
-            export_rows.append(
-                {
-                    "ID": report.get("id"),
-                    "Тип": report.get("defect_type"),
-                    "Адрес": report.get("address"),
-                    "Широта": report.get("latitude"),
-                    "Долгота": report.get("longitude"),
-                    "Серьёзность": report.get("severity"),
-                    "Приоритет": report.get("priority_score"),
-                    "Статус": report.get("status"),
-                    "Голоса": report.get("votes_count", 0),
-                    "Комментарии": report.get("comments_count", 0),
-                    "Дата": report.get("created_at"),
-                }
+    with dashboard:
+
+        st.markdown(
+            "### Статистика дорожных обращений"
+        )
+
+        if reports:
+
+            df = pd.DataFrame(reports)
+
+            st.markdown("#### Обращения по статусам")
+
+            counts = (
+                df["status"]
+                .fillna("Не указан")
+                .value_counts()
             )
 
-        export_df = pd.DataFrame(export_rows)
+            st.bar_chart(counts)
 
-        csv_data = export_df.to_csv(
-            index=False,
-        ).encode("utf-8-sig")
+            st.markdown(
+                "#### Самые срочные обращения"
+            )
 
-        st.download_button(
-            "⬇️ Скачать CSV",
-            data=csv_data,
-            file_name="taraz_road_reports.csv",
-            mime="text/csv",
-        )
+            urgent = sorted(
+                active_reports,
+                key=lambda r: float(
+                    r.get("priority_score") or 0
+                ),
+                reverse=True,
+            )[:10]
 
-    st.divider()
+            if urgent:
 
-    st.markdown("### 🛠️ Управление обращениями")
+                table = pd.DataFrame([
+                    {
+                        "№": r.get("id"),
+                        "Адрес": r.get("address"),
+                        "Проблема": r.get("defect_type"),
+                        "Приоритет": r.get(
+                            "priority_score"
+                        ),
+                        "Статус": r.get("status"),
+                    }
+                    for r in urgent
+                ])
 
-    if not admin_reports:
-        st.info("Обращений пока нет.")
-
-    else:
-        admin_search = st.text_input(
-            "Найти обращение",
-            placeholder="Введите номер или адрес",
-            key="admin_search",
-        )
-
-        admin_status_filter = st.selectbox(
-            "Фильтр по статусу",
-            ["Все"] + STATUSES,
-            key="admin_status",
-        )
-
-        filtered_admin = admin_reports
-
-        if admin_status_filter != "Все":
-            filtered_admin = [
-                report
-                for report in filtered_admin
-                if report.get("status") == admin_status_filter
-            ]
-
-        if admin_search.strip():
-            query = admin_search.lower().strip()
-
-            filtered_admin = [
-                report
-                for report in filtered_admin
-                if (
-                    query in str(report.get("id") or "")
-                    or query in str(report.get("address") or "").lower()
+                st.dataframe(
+                    table,
+                    hide_index=True,
+                    width="stretch",
                 )
-            ]
+
+            else:
+
+                st.success(
+                    "Открытых срочных обращений нет."
+                )
+
+        else:
+
+            st.info(
+                "Пока недостаточно данных."
+            )
+
+    # ========================================================
+    # ТОП ДОРОГ
+    # ========================================================
+
+    with ranking_tab:
+
+        st.markdown(
+            "### 🚧 Топ-10 проблемных дорог"
+        )
 
         st.caption(
-            f"Показано обращений: {len(filtered_admin)}"
+            "Рейтинг основан на количестве "
+            "открытых обращений, срочности "
+            "и голосах жителей."
         )
 
-        for report in filtered_admin:
-            report_id = report.get("id")
+        if roads:
+
+            top = roads[:10]
+
+            ranking_df = pd.DataFrame(top)
+
+            st.dataframe(
+                ranking_df[
+                    [
+                        "Улица / участок",
+                        "Рейтинг",
+                        "Заявок",
+                        "Голосов",
+                        "Макс. срочность",
+                        "Обращения",
+                    ]
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+
+            st.markdown(
+                "#### Визуальное сравнение"
+            )
+
+            chart_data = (
+                ranking_df
+                .set_index("Улица / участок")["Рейтинг"]
+            )
+
+            st.bar_chart(
+                chart_data,
+                horizontal=True,
+            )
+
+        else:
+
+            st.info(
+                "Нет активных обращений "
+                "с указанным адресом."
+            )
+
+        st.caption(
+            "Это предварительный рейтинг. "
+            "Для более точной группировки "
+            "нужны нормализованные адреса "
+            "и географические данные."
+        )
+
+    # ========================================================
+    # УПРАВЛЕНИЕ
+    # ========================================================
+
+    with manage:
+
+        st.markdown(
+            "### 🛠️ Управление обращениями"
+        )
+
+        search = st.text_input(
+            "Поиск по номеру или адресу",
+            key="admin_search_v2",
+        )
+
+        status_filter = st.selectbox(
+            "Фильтр по статусу",
+            ["Все"] + STATUSES,
+            key="admin_filter_v2",
+        )
+
+        ordered_reports = sorted(
+            reports,
+            key=lambda r: float(
+                r.get("priority_score") or 0
+            ),
+            reverse=True,
+        )
+
+        for report in ordered_reports:
+
+            rid = int(report["id"])
+
+            if (
+                status_filter != "Все"
+                and report.get("status") != status_filter
+            ):
+                continue
+
+            searchable = (
+                str(rid)
+                + " "
+                + str(report.get("address") or "")
+            ).casefold()
+
+            if (
+                search
+                and search.casefold() not in searchable
+            ):
+                continue
 
             with st.expander(
-                f"#{report_id} · "
+                f"#{rid} · "
                 f"{report.get('defect_type')} · "
-                f"{report.get('status')}"
+                f"{report.get('status')} · "
+                f"{report.get('priority_score', 0)}/100"
             ):
-                col_photo, col_details = st.columns([1, 2])
 
-                with col_photo:
-                    display_image(
+                left, right = st.columns([1, 2])
+
+                with left:
+
+                    show_photo(
                         report.get("image_path"),
-                        "Фото проблемы",
+                        "До ремонта",
                     )
 
-                    display_image(
-                        report.get("after_image_path"),
-                        "После ремонта",
-                    )
+                    if report.get("after_image_path"):
 
-                with col_details:
-                    st.write(
-                        f"**Адрес:** {report.get('address') or '—'}"
-                    )
+                        show_photo(
+                            report.get("after_image_path"),
+                            "После ремонта",
+                        )
 
-                    st.write(
-                        f"**Приоритет:** "
-                        f"{priority_label(report.get('priority_score'), report.get('votes_count'))}"
-                    )
+                with right:
 
                     st.write(
-                        f"**Поддержали:** "
-                        f"{report.get('votes_count') or 0}"
+                        "**Адрес:**",
+                        report.get("address")
+                        or "Не указан",
                     )
 
-                    current_status = (
-                        report.get("status")
-                        if report.get("status") in STATUSES
-                        else "Новая"
+                    st.write(
+                        "**Поддержали:**",
+                        report.get("votes_count") or 0,
                     )
 
-                    selected_status = st.selectbox(
-                        "Новый статус",
+                    if report.get("mode") == "ai":
+
+                        st.success(
+                            "🤖 Обращение с AI-анализом"
+                        )
+
+                    else:
+
+                        st.caption(
+                            "Ручное определение дефекта"
+                        )
+
+                    # Повторная проверка ИИ
+
+                    if st.button(
+                        "🤖 Проверить фото через ИИ",
+                        key=f"admin_ai_v2_{rid}",
+                    ):
+
+                        image_path = report.get(
+                            "image_path"
+                        )
+
+                        if (
+                            image_path
+                            and Path(str(image_path)).is_file()
+                        ):
+
+                            result = detect_road_damage(
+                                Path(image_path).read_bytes()
+                            )
+
+                            show_ai(
+                                result,
+                                show_photo=True,
+                            )
+
+                        else:
+
+                            st.warning(
+                                "Фотография недоступна."
+                            )
+
+                    # Изменение статуса
+
+                    current = report.get("status")
+
+                    idx = (
+                        STATUSES.index(current)
+                        if current in STATUSES
+                        else 0
+                    )
+
+                    new_status = st.selectbox(
+                        "Статус обращения",
                         STATUSES,
-                        index=STATUSES.index(current_status),
-                        key=f"admin_status_{report_id}",
+                        index=idx,
+                        key=f"edit_status_v2_{rid}",
                     )
 
                     if st.button(
                         "💾 Сохранить статус",
-                        key=f"save_status_{report_id}",
+                        key=f"admin_save_v2_{rid}",
                     ):
-                        try:
-                            call_database(
-                                update_status,
-                                report_id=report_id,
-                                status=selected_status,
-                                new_status=selected_status,
-                            )
 
-                            st.success("Статус обновлён.")
-                            st.rerun()
+                        update_status(
+                            rid,
+                            new_status,
+                        )
 
-                        except Exception as exc:
-                            st.error(
-                                f"Ошибка обновления статуса: {exc}"
-                            )
-
-                st.markdown("**📷 Фото после ремонта**")
-
-                after_image = st.file_uploader(
-                    "Добавить фото выполненной работы",
-                    type=["jpg", "jpeg", "png"],
-                    key=f"after_photo_{report_id}",
-                )
-
-                if after_image is not None:
-                    if st.button(
-                        "Сохранить фото после ремонта",
-                        key=f"save_after_{report_id}",
-                    ):
-                        try:
-                            after_data = after_image.getvalue()
-
-                            call_database(
-                                save_after_photo,
-                                report_id=report_id,
-                                image_bytes=after_data,
-                                image_data=after_data,
-                                image=after_data,
-                                filename=after_image.name,
-                            )
-
-                            st.success("Фото сохранено.")
-                            st.rerun()
-
-                        except Exception as exc:
-                            st.error(
-                                f"Не удалось сохранить фото: {exc}"
-                            )
-
-                with st.expander("История изменения статуса"):
-                    render_history(report_id)
+                        st.rerun()
 
                 st.divider()
 
-                st.markdown("**🗑️ Удаление обращения**")
+                # Фото после ремонта
 
-                confirm_delete = st.checkbox(
-                    f"Подтверждаю удаление обращения #{report_id}",
-                    key=f"confirm_delete_{report_id}",
+                st.markdown(
+                    "#### 📷 Подтверждение ремонта"
+                )
+
+                photo_source = st.radio(
+                    "Добавить фото после ремонта",
+                    [
+                        "🖼️ Галерея",
+                        "📷 Камера",
+                    ],
+                    horizontal=True,
+                    key=f"after_source_v2_{rid}",
+                )
+
+                if photo_source.startswith("📷"):
+
+                    after = st.camera_input(
+                        "Снять отремонтированный участок",
+                        key=f"after_cam_v2_{rid}",
+                    )
+
+                else:
+
+                    after = st.file_uploader(
+                        "Загрузить фотографию",
+                        type=[
+                            "jpg",
+                            "jpeg",
+                            "png",
+                        ],
+                        key=f"after_gallery_v2_{rid}",
+                    )
+
+                if after is not None:
+
+                    if st.button(
+                        "Сохранить фото после ремонта",
+                        key=f"save_after_v2_{rid}",
+                    ):
+
+                        save_after_photo(
+                            rid,
+                            photo_bytes(after),
+                        )
+
+                        st.rerun()
+
+                # История
+
+                with st.expander(
+                    "История изменения статуса"
+                ):
+
+                    show_history(rid)
+
+                # Удаление
+
+                st.divider()
+
+                confirmed = st.checkbox(
+                    f"Подтверждаю удаление #{rid}",
+                    key=f"confirm_delete_v2_{rid}",
                 )
 
                 if st.button(
-                    "Удалить обращение",
-                    key=f"delete_{report_id}",
-                    disabled=not confirm_delete,
+                    "🗑️ Удалить обращение",
+                    key=f"delete_v2_{rid}",
+                    disabled=not confirmed,
                 ):
-                    try:
-                        call_database(
-                            delete_report,
-                            report_id=report_id,
-                        )
 
-                        st.success("Обращение удалено.")
-                        st.rerun()
+                    delete_report(rid)
 
-                    except Exception as exc:
-                        st.error(
-                            f"Не удалось удалить обращение: {exc}"
-                        )
+                    st.rerun()
+
+    # ========================================================
+    # ЭКСПОРТ
+    # ========================================================
+
+    with export:
+
+        st.markdown(
+            "### 📥 Скачать данные обращений"
+        )
+
+        if reports:
+
+            columns = [
+                "id",
+                "defect_type",
+                "address",
+                "priority_score",
+                "status",
+                "votes_count",
+                "created_at",
+            ]
+
+            rows = [
+                {
+                    key: report.get(key)
+                    for key in columns
+                }
+                for report in reports
+            ]
+
+            export_df = pd.DataFrame(rows)
+
+            csv_data = export_df.to_csv(
+                index=False
+            ).encode("utf-8-sig")
+
+            st.download_button(
+                "⬇️ Скачать CSV",
+                data=csv_data,
+                file_name="taraz_road_reports.csv",
+                mime="text/csv",
+            )
+
+        else:
+
+            st.info(
+                "Нет обращений для экспорта."
+            )
+
 
 
 # ============================================================
@@ -1258,6 +1822,6 @@ with tab_admin:
 st.divider()
 
 st.caption(
-    "Taraz Road AI · Digital Taraz Hackathon 2026 · "
-    "Прототип цифровой платформы для жителей города Тараз"
+    "Taraz Road AI · Прототип. "
+    "AI-оценки требуют проверки специалистом."
 )
