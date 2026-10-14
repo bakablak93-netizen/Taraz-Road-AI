@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+*.pyc
+data/*.db
+uploads/*
+!uploads/.gitkeep
+models/*.pt
