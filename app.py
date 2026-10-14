@@ -10,6 +10,11 @@ import pandas as pd
 import streamlit as st
 import folium
 
+from services.detection import (
+    detect_road_damage,
+    model_available,
+)
+
 from services.database import (
     init_db,
     add_report,
@@ -510,8 +515,9 @@ st.write("")
 # ВКЛАДКИ
 # ============================================================
 
-tab_new, tab_feed, tab_map, tab_track, tab_admin = st.tabs(
+tab_ai, tab_new, tab_feed, tab_map, tab_track, tab_admin = st.tabs(
     [
+        "🤖 AI-анализ",
         "➕ Новое обращение",
         "📰 Лента проблем",
         "🗺️ Карта",
@@ -524,6 +530,87 @@ tab_new, tab_feed, tab_map, tab_track, tab_admin = st.tabs(
 # ============================================================
 # 1. НОВОЕ ОБРАЩЕНИЕ
 # ============================================================
+
+# ============================================================
+# AI-РАСПОЗНАВАНИЕ ДОРОЖНЫХ ДЕФЕКТОВ
+# ============================================================
+
+with tab_ai:
+    st.subheader("🤖 Распознавание дорожных повреждений")
+
+    st.write(
+        "Загрузите фотографию дороги. "
+        "ИИ попробует обнаружить повреждения."
+    )
+
+    if model_available():
+        st.success("✅ Файл модели найден")
+    else:
+        st.warning(
+            "⚠️ Модель ещё не подключена. "
+            "Необходимо добавить models/road_damage.pt"
+        )
+
+    ai_image = st.file_uploader(
+        "Выберите фотографию",
+        type=["jpg", "jpeg", "png"],
+        key="ai_test_image",
+    )
+
+    if ai_image is not None:
+        st.image(
+            ai_image,
+            caption="Исходная фотография",
+            use_container_width=True,
+        )
+
+        if st.button(
+            "🔍 Анализировать фотографию",
+            type="primary",
+            key="start_ai_detection",
+        ):
+            with st.spinner("Анализ фотографии..."):
+                result = detect_road_damage(
+                    ai_image.getvalue()
+                )
+
+            if result["mode"] == "ai":
+                st.success("✅ Анализ завершён")
+
+                st.write(
+                    "**Обнаруженный дефект:**",
+                    result["label"],
+                )
+
+                confidence = result["confidence"] * 100
+
+                st.metric(
+                    "Уверенность модели",
+                    f"{confidence:.1f}%",
+                )
+
+                if result["annotated_image"] is not None:
+                    st.image(
+                        result["annotated_image"],
+                        caption="Результат распознавания",
+                        use_container_width=True,
+                    )
+
+                if result["confidence"] < 0.5:
+                    st.warning(
+                        "Уверенность модели низкая. "
+                        "Рекомендуется ручная проверка."
+                    )
+
+            else:
+                st.info(
+                    "ИИ пока не выполняет распознавание. "
+                    "Для настоящего анализа нужна "
+                    "обученная модель YOLO."
+                )
+
+                if result.get("error"):
+                    st.error(result["error"])
 
 with tab_new:
     st.subheader("Сообщить о проблеме")
